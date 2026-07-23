@@ -1,14 +1,12 @@
 [Unit]
 Description=Database Backup Manager (Gunicorn)
-After=network-online.target docker.service
+After=network-online.target
 Wants=network-online.target
-Requires=docker.service
 
 [Service]
 Type=simple
 User=backupmgr
 Group=backupmgr
-SupplementaryGroups=docker
 WorkingDirectory=/opt/db-backup-manager
 EnvironmentFile=/etc/db-backup-manager.env
 Environment=PYTHONDONTWRITEBYTECODE=1

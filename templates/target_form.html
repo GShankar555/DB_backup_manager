@@ -1,24 +1,62 @@
 {% extends "base.html" %}
 {% block title %}{{ 'Edit' if target else 'Add' }} database · Backup Manager{% endblock %}
 {% block content %}
-<div class="page-head"><div><h1>{{ 'Edit' if target else 'Add' }} database</h1><p>The database tools must exist inside the selected Docker container.</p></div></div>
+<div class="page-head"><div><h1>{{ 'Edit' if target else 'Add' }} database</h1><p>Connect by host and port, or select a Docker container running on this VPS.</p></div></div>
 <form class="panel form-grid" method="post">
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>Display name<input name="name" value="{{ target.name if target else '' }}" placeholder="production-postgres" required></label>
   <label>Database type
-    <select name="db_type" required>
+    <select name="db_type" id="db-type" required>
       {% for value, label in [('postgres','PostgreSQL'),('mysql','MySQL'),('mssql','Microsoft SQL Server')] %}
       <option value="{{ value }}" {{ 'selected' if target and target.db_type == value }}>{{ label }}</option>
       {% endfor %}
     </select>
   </label>
-  <label>Docker container name<input name="container_name" value="{{ target.container_name if target else '' }}" placeholder="postgres-db" required></label>
+  <label>Connection type
+    <select name="connection_mode" id="connection-mode" required>
+      <option value="network" {{ 'selected' if not target or target.connection_mode == 'network' }}>Network host or IP</option>
+      <option value="docker" {{ 'selected' if target and target.connection_mode == 'docker' }}>Local Docker container</option>
+    </select>
+    <small>Use Docker only when the container runs on this same VPS.</small>
+  </label>
+  <label class="network-field">Database host or IP
+    <input name="db_host" id="db-host" value="{{ target.db_host if target else '' }}" placeholder="db.example.com or 10.0.0.20">
+  </label>
+  <label class="network-field">Database port
+    <input type="number" name="db_port" id="db-port" min="1" max="65535" value="{{ target.db_port if target and target.db_port else '' }}" placeholder="Uses the database default">
+  </label>
+  <label class="docker-field">Local Docker container name
+    <input name="container_name" id="container-name" value="{{ target.container_name if target else '' }}" placeholder="postgres-db">
+  </label>
   <label>Database name<input name="db_name" value="{{ target.db_name if target else '' }}" required></label>
   <label>Database username<input name="db_user" value="{{ target.db_user if target else '' }}" autocomplete="off" required></label>
   <label>Password<input type="password" name="password" autocomplete="new-password" {{ '' if target else 'required' }} placeholder="{{ 'Leave blank to keep current password' if target else '' }}"></label>
-  <label>Cron expression<input name="cron_expression" value="{{ target.cron_expression if target else '0 2 * * *' }}" required><small>Five fields: minute hour day month weekday</small></label>
+  <label>Cron expression<input name="cron_expression" value="{{ target.cron_expression if target else '0 2 * * *' }}" required><small>Five fields: minute hour day month weekday. System cron triggers due backups.</small></label>
   <label>Retention in days<input type="number" name="retention_days" min="1" value="{{ target.retention_days if target else 30 }}" required></label>
   <label class="checkbox"><input type="checkbox" name="enabled" {{ 'checked' if not target or target.enabled }}> Enable scheduled backups</label>
   <div class="form-actions"><button type="submit">Save database</button><a class="button secondary" href="{{ url_for('dashboard') }}">Cancel</a></div>
 </form>
+<script>
+  const mode = document.getElementById("connection-mode");
+  const dbType = document.getElementById("db-type");
+  const host = document.getElementById("db-host");
+  const port = document.getElementById("db-port");
+  const container = document.getElementById("container-name");
+  const defaultPorts = {postgres: "5432", mysql: "3306", mssql: "1433"};
+
+  function updateConnectionFields() {
+    const network = mode.value === "network";
+    document.querySelectorAll(".network-field").forEach(element => element.hidden = !network);
+    document.querySelectorAll(".docker-field").forEach(element => element.hidden = network);
+    host.required = network;
+    container.required = !network;
+    if (network && !port.value) port.value = defaultPorts[dbType.value];
+  }
+
+  mode.addEventListener("change", updateConnectionFields);
+  dbType.addEventListener("change", () => {
+    port.value = defaultPorts[dbType.value];
+  });
+  updateConnectionFields();
+</script>
 {% endblock %}

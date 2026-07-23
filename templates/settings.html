@@ -4,11 +4,21 @@
 <div class="page-head"><div><h1>Google Drive</h1><p>Optional cloud destination. Without it, backups remain on local storage.</p></div></div>
 <form class="panel settings-form" method="post">
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-  <label>Drive folder ID<input name="google_drive_folder_id" value="{{ folder_id }}" placeholder="1AbCdEf..."></label>
+  <label>Drive folder ID
+    <input name="google_drive_folder_id" value="{{ folder_id }}" placeholder="1AbCdEf..." {{ 'readonly' if folder_id_from_env }}>
+    {% if folder_id_from_env %}<small>Configured by GOOGLE_DRIVE_FOLDER_ID in the environment.</small>{% endif %}
+  </label>
+  <div class="credential-status">
+    <strong>File authentication: {{ google_auth_mode }}</strong>
+    <span class="{{ 'present' if token_file_present else 'missing' }}">OAuth token: {{ token_file }} — {{ 'found' if token_file_present else 'not found' }}</span>
+    <span class="{{ 'present' if credentials_file_present else 'missing' }}">Service account: {{ credentials_file }} — {{ 'found' if credentials_file_present else 'not found' }}</span>
+  </div>
+  {% if not token_file_present and not credentials_file_present %}
   <label>Service account JSON
     <textarea name="google_service_account_json" rows="12" placeholder="{{ 'A credential is configured. Paste a replacement only when changing it.' if service_account_configured else 'Paste the complete service-account JSON document' }}"></textarea>
   </label>
-  <p class="hint">Create a Drive folder and share it with the service account’s email address. Credentials are encrypted before being stored in SQLite.</p>
+  {% endif %}
+  <p class="hint">OAuth uses the Google user represented by the token. For a service account, share the folder with its client_email. Environment credential files take precedence over credentials stored in SQLite.</p>
   <button type="submit">Save settings</button>
 </form>
 {% endblock %}

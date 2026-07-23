@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="page-head">
-  <div><h1>Database backups</h1><p>Container backups, schedules, retention, and recent activity.</p></div>
+  <div><h1>Database backups</h1><p>Network and local Docker backups, cron schedules, retention, and recent activity.</p></div>
   <a class="button" href="{{ url_for('target_form') }}">Add database</a>
 </div>
 
@@ -13,10 +13,19 @@
       <span class="status {{ 'on' if target.enabled else 'off' }}">{{ 'Enabled' if target.enabled else 'Paused' }}</span>
     </div>
     <dl>
-      <div><dt>Container</dt><dd>{{ target.container_name }}</dd></div>
+      <div>
+        <dt>Connection</dt>
+        <dd>
+          {% if target.connection_mode == 'docker' %}
+            Docker · {{ target.container_name }}
+          {% else %}
+            {{ target.db_host }}:{{ target.db_port }}
+          {% endif %}
+        </dd>
+      </div>
       <div><dt>Database</dt><dd>{{ target.db_name }}</dd></div>
       <div><dt>Schedule</dt><dd><code>{{ target.cron_expression }}</code></dd></div>
-      <div><dt>Next run</dt><dd>{{ jobs.get('backup_' ~ target.id) or 'Not scheduled' }}</dd></div>
+      <div><dt>Next due</dt><dd>{{ next_runs.get(target.id) or 'Not scheduled' }}</dd></div>
       <div><dt>Retention</dt><dd>{{ target.retention_days }} days</dd></div>
     </dl>
     <div class="actions">

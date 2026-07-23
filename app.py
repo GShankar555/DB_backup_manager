@@ -1,30 +1,42 @@
 import base64
+import fcntl
 import gzip
 import hashlib
-import io
 import json
 import os
+import re
 import subprocess
 import threading
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
+import click
 from cryptography.fernet import Fernet, InvalidToken
+from croniter import croniter
 from flask import Flask, flash, redirect, render_template, request, url_for
-from flask_apscheduler import APScheduler
 from flask_login import LoginManager, UserMixin, current_user, login_required, login_user, logout_user
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf.csrf import CSRFProtect
-from werkzeug.middleware.proxy_fix import ProxyFix
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as OAuthCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text
 from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", DATA_DIR / "backups"))
+BACKUP_TIMEOUT = int(os.getenv("BACKUP_TIMEOUT", "7200"))
+GOOGLE_TOKEN_FILE = Path(os.getenv("GOOGLE_TOKEN_FILE", "/opt/creds/token.json"))
+GOOGLE_CREDENTIALS_FILE = Path(
+    os.getenv("GOOGLE_CREDENTIALS_FILE", "/opt/creds/credentials.json")
+)
+GOOGLE_AUTH_MODE = os.getenv("GOOGLE_AUTH_MODE", "auto").strip().lower()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -33,17 +45,19 @@ app.config.update(
     SECRET_KEY=os.getenv("SECRET_KEY", "change-this-secret-in-production"),
     SQLALCHEMY_DATABASE_URI=f"sqlite:///{DATA_DIR / 'backup_manager.db'}",
     SQLALCHEMY_TRACK_MODIFICATIONS=False,
-    SCHEDULER_API_ENABLED=False,
-    SCHEDULER_TIMEZONE=os.getenv("TZ", "Asia/Kolkata"),
 )
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 db = SQLAlchemy(app)
 csrf = CSRFProtect(app)
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
-scheduler = APScheduler()
-scheduler.init_app(app)
-backup_lock = threading.Lock()
+
+DATABASE_TYPES = {"postgres", "mysql", "mssql"}
+CONNECTION_MODES = {"network", "docker"}
+DEFAULT_PORTS = {"postgres": 5432, "mysql": 3306, "mssql": 1433}
+SAFE_TARGET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
+SAFE_CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,149}$")
+GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
 def _fernet():
@@ -79,7 +93,10 @@ class BackupTarget(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), unique=True, nullable=False)
     db_type = db.Column(db.String(20), nullable=False)
-    container_name = db.Column(db.String(150), nullable=False)
+    connection_mode = db.Column(db.String(20), nullable=False, default="network")
+    db_host = db.Column(db.String(255), nullable=False, default="")
+    db_port = db.Column(db.Integer)
+    container_name = db.Column(db.String(150), nullable=False, default="")
     db_name = db.Column(db.String(150), nullable=False)
     db_user = db.Column(db.String(150), nullable=False)
     password_encrypted = db.Column(db.Text, nullable=False, default="")
@@ -126,70 +143,240 @@ def save_setting(key, value):
     db.session.add(row)
 
 
-def cron_kwargs(expression):
+def validate_cron_expression(expression):
     parts = expression.split()
     if len(parts) != 5:
         raise ValueError("Cron expression must contain 5 fields: minute hour day month weekday")
-    minute, hour, day, month, weekday = parts
-    # APScheduler uses mon-sun/0-6, while standard cron uses sun=0/7.
-    weekday = "sun" if weekday in {"0", "7"} else weekday
-    return dict(minute=minute, hour=hour, day=day, month=month, day_of_week=weekday)
+    if not croniter.is_valid(expression):
+        raise ValueError("Cron expression contains an invalid value")
+    return parts
 
 
-def sync_jobs():
-    for job in scheduler.get_jobs():
-        if job.id.startswith("backup_"):
-            scheduler.remove_job(job.id)
-    with app.app_context():
-        targets = db.session.execute(select(BackupTarget).where(BackupTarget.enabled.is_(True))).scalars()
-        for target in targets:
-            try:
-                scheduler.add_job(
-                    id=f"backup_{target.id}",
-                    func=run_backup_job,
-                    args=[target.id],
-                    trigger="cron",
-                    replace_existing=True,
-                    max_instances=1,
-                    **cron_kwargs(target.cron_expression),
-                )
-            except ValueError:
-                app.logger.exception("Invalid schedule for target %s", target.name)
+def next_run_time(expression):
+    try:
+        validate_cron_expression(expression)
+        now = datetime.now(ZoneInfo(os.getenv("TZ", "Asia/Kolkata")))
+        return croniter(expression, now).get_next(datetime)
+    except (ValueError, KeyError):
+        return None
+
+
+def validated_target_values(form, existing_target=None):
+    name = form.get("name", "").strip()
+    db_type = form.get("db_type", "")
+    connection_mode = form.get("connection_mode", "")
+    db_host = form.get("db_host", "").strip()
+    container_name = form.get("container_name", "").strip()
+
+    if not SAFE_TARGET_NAME.fullmatch(name):
+        raise ValueError("Display name may contain only letters, numbers, dots, underscores, and hyphens.")
+    if db_type not in DATABASE_TYPES:
+        raise ValueError("Unsupported database type.")
+    if connection_mode not in CONNECTION_MODES:
+        raise ValueError("Choose either network host or local Docker container.")
+
+    if connection_mode == "network":
+        if not db_host or len(db_host) > 255 or any(character.isspace() for character in db_host):
+            raise ValueError("Enter a valid database host name or IP address.")
+        try:
+            db_port = int(form.get("db_port") or DEFAULT_PORTS[db_type])
+        except ValueError as exc:
+            raise ValueError("Database port must be a number.") from exc
+        if not 1 <= db_port <= 65535:
+            raise ValueError("Database port must be between 1 and 65535.")
+        container_name = ""
+    else:
+        if not SAFE_CONTAINER_NAME.fullmatch(container_name):
+            raise ValueError("Enter a valid local Docker container name.")
+        db_host = ""
+        db_port = None
+
+    cron_expression = form.get("cron_expression", "").strip()
+    validate_cron_expression(cron_expression)
+    try:
+        retention_days = max(1, int(form.get("retention_days", "30")))
+    except ValueError as exc:
+        raise ValueError("Retention must be a whole number of days.") from exc
+
+    password = form.get("password", "")
+    if existing_target is None and not password:
+        raise ValueError("A database password is required.")
+
+    db_name = form.get("db_name", "").strip()
+    db_user = form.get("db_user", "").strip()
+    if not db_name or not db_user:
+        raise ValueError("Database name and username are required.")
+
+    return {
+        "name": name,
+        "db_type": db_type,
+        "connection_mode": connection_mode,
+        "db_host": db_host,
+        "db_port": db_port,
+        "container_name": container_name,
+        "db_name": db_name,
+        "db_user": db_user,
+        "password": password,
+        "cron_expression": cron_expression,
+        "retention_days": retention_days,
+        "enabled": "enabled" in form,
+    }
+
+
+def command_environment(target):
+    environment = os.environ.copy()
+    if target.db_type == "postgres":
+        environment["PGPASSWORD"] = target.password
+    elif target.db_type == "mysql":
+        environment["MYSQL_PWD"] = target.password
+    elif target.db_type == "mssql":
+        environment["SQLCMDPASSWORD"] = target.password
+    return environment
 
 
 def docker_dump_command(target):
     if target.db_type == "postgres":
         return [
-            "docker", "exec", "-e", f"PGPASSWORD={target.password}",
+            "docker", "exec", "-e", "PGPASSWORD",
             target.container_name, "pg_dump", "-U", target.db_user,
             "-d", target.db_name, "--no-password",
         ], "sql"
     if target.db_type == "mysql":
         return [
-            "docker", "exec", "-e", f"MYSQL_PWD={target.password}",
+            "docker", "exec", "-e", "MYSQL_PWD",
             target.container_name, "mysqldump", "-u", target.db_user,
             "--single-transaction", "--routines", "--events", target.db_name,
         ], "sql"
     if target.db_type == "mssql":
+        database_name = target.db_name.replace("]", "]]")
         return [
-            "docker", "exec", "-e", f"SQLCMDPASSWORD={target.password}",
+            "docker", "exec", "-e", "SQLCMDPASSWORD",
             target.container_name, "/opt/mssql-tools18/bin/sqlcmd",
             "-C", "-S", "localhost", "-U", target.db_user,
-            "-Q", f"BACKUP DATABASE [{target.db_name}] TO DISK='/var/opt/mssql/backup/{target.name}.bak' WITH INIT",
+            "-Q", f"BACKUP DATABASE [{database_name}] TO DISK='/var/opt/mssql/backup/{target.name}.bak' WITH INIT",
         ], "bak"
     raise ValueError(f"Unsupported database type: {target.db_type}")
 
 
+def network_dump_command(target, output_path=None):
+    port = str(target.db_port or DEFAULT_PORTS[target.db_type])
+    if target.db_type == "postgres":
+        return [
+            "pg_dump", "--host", target.db_host, "--port", port,
+            "--username", target.db_user, "--dbname", target.db_name,
+            "--no-password",
+        ], "sql"
+    if target.db_type == "mysql":
+        return [
+            "mysqldump", f"--host={target.db_host}", f"--port={port}",
+            f"--user={target.db_user}", "--single-transaction", "--routines",
+            "--events", target.db_name,
+        ], "sql"
+    if target.db_type == "mssql":
+        if output_path is None:
+            raise ValueError("An output path is required for an MSSQL network export")
+        return [
+            "sqlpackage", "/Action:Export",
+            f"/SourceServerName:{target.db_host},{port}",
+            f"/SourceDatabaseName:{target.db_name}",
+            f"/SourceUser:{target.db_user}",
+            f"/SourcePassword:{target.password}",
+            "/SourceEncryptConnection:True",
+            "/SourceTrustServerCertificate:True",
+            f"/TargetFile:{output_path}",
+        ], "bacpac"
+    raise ValueError(f"Unsupported database type: {target.db_type}")
+
+
+def google_credentials_from_files():
+    if GOOGLE_AUTH_MODE not in {"auto", "oauth", "service_account"}:
+        raise RuntimeError(
+            "GOOGLE_AUTH_MODE must be auto, oauth, or service_account."
+        )
+
+    oauth_error = None
+    if GOOGLE_AUTH_MODE in {"auto", "oauth"} and GOOGLE_TOKEN_FILE.is_file():
+        try:
+            credentials = OAuthCredentials.from_authorized_user_file(
+                GOOGLE_TOKEN_FILE,
+                scopes=GOOGLE_DRIVE_SCOPES,
+            )
+            if credentials.expired and credentials.refresh_token:
+                credentials.refresh(GoogleAuthRequest())
+            if not credentials.valid:
+                raise ValueError("the OAuth token is not valid and cannot be refreshed")
+            return credentials, f"OAuth token file {GOOGLE_TOKEN_FILE}"
+        except Exception as exc:
+            oauth_error = (
+                f"Could not load Google OAuth token {GOOGLE_TOKEN_FILE}: {exc}"
+            )
+            if GOOGLE_AUTH_MODE == "oauth":
+                raise RuntimeError(oauth_error) from exc
+    elif GOOGLE_AUTH_MODE == "oauth":
+        raise RuntimeError(f"Google OAuth token file not found: {GOOGLE_TOKEN_FILE}")
+
+    if (
+        GOOGLE_AUTH_MODE in {"auto", "service_account"}
+        and GOOGLE_CREDENTIALS_FILE.is_file()
+    ):
+        try:
+            info = json.loads(GOOGLE_CREDENTIALS_FILE.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Could not read Google credentials {GOOGLE_CREDENTIALS_FILE}: {exc}"
+            ) from exc
+        if info.get("type") == "service_account":
+            credentials = service_account.Credentials.from_service_account_info(
+                info,
+                scopes=GOOGLE_DRIVE_SCOPES,
+            )
+            if oauth_error:
+                app.logger.warning("%s; falling back to the service account.", oauth_error)
+            return credentials, f"service-account file {GOOGLE_CREDENTIALS_FILE}"
+        if "installed" in info or "web" in info:
+            raise RuntimeError(
+                f"{GOOGLE_CREDENTIALS_FILE} is an OAuth client-secret file. "
+                f"An authorized-user token is also required at {GOOGLE_TOKEN_FILE}."
+            )
+        raise RuntimeError(
+            f"{GOOGLE_CREDENTIALS_FILE} is not a service-account credential."
+        )
+    if GOOGLE_AUTH_MODE == "service_account":
+        raise RuntimeError(
+            f"Google service-account file not found: {GOOGLE_CREDENTIALS_FILE}"
+        )
+    if oauth_error:
+        raise RuntimeError(oauth_error)
+
+    return None, None
+
+
 def drive_service():
-    raw = setting("google_service_account_json")
-    folder_id = setting("google_drive_folder_id")
-    if not raw or not folder_id:
-        return None, None
-    info = json.loads(raw)
-    credentials = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/drive"]
+    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip() or setting(
+        "google_drive_folder_id"
     )
-    return build("drive", "v3", credentials=credentials, cache_discovery=False), folder_id
+    if not folder_id:
+        return None, None
+
+    credentials, source = google_credentials_from_files()
+    if credentials is None:
+        raw = setting("google_service_account_json")
+        if not raw:
+            return None, None
+        info = json.loads(raw)
+        credentials = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=GOOGLE_DRIVE_SCOPES,
+        )
+        source = "encrypted dashboard service-account credential"
+
+    app.logger.info("Using Google Drive credentials from %s", source)
+    return build(
+        "drive",
+        "v3",
+        credentials=credentials,
+        cache_discovery=False,
+    ), folder_id
 
 
 def upload_to_drive(path):
@@ -197,7 +384,8 @@ def upload_to_drive(path):
     if not service:
         return None
     metadata = {"name": path.name, "parents": [folder_id]}
-    media = MediaFileUpload(str(path), mimetype="application/gzip", resumable=True)
+    mimetype = "application/gzip" if path.suffix == ".gz" else "application/octet-stream"
+    media = MediaFileUpload(str(path), mimetype=mimetype, resumable=True)
     return service.files().create(body=metadata, media_body=media, fields="id").execute()["id"]
 
 
@@ -227,37 +415,133 @@ def cleanup_retention(target):
             break
 
 
+def acquire_backup_lock(target_id):
+    lock_path = DATA_DIR / f"backup-{target_id}.lock"
+    lock_file = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_file)
+        return None
+    return lock_file
+
+
+def release_backup_lock(lock_file):
+    fcntl.flock(lock_file, fcntl.LOCK_UN)
+    os.close(lock_file)
+
+
+def stream_command_to_gzip(command, environment, output_path):
+    timed_out = threading.Event()
+    with tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            env=environment,
+        )
+
+        def stop_process():
+            timed_out.set()
+            process.kill()
+
+        timer = threading.Timer(BACKUP_TIMEOUT, stop_process)
+        timer.daemon = True
+        timer.start()
+        try:
+            with gzip.open(output_path, "wb", compresslevel=6) as compressed:
+                while chunk := process.stdout.read(1024 * 1024):
+                    compressed.write(chunk)
+            return_code = process.wait()
+        except Exception:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            timer.cancel()
+
+        stderr_file.seek(0)
+        stderr = stderr_file.read().decode(errors="replace")
+        if timed_out.is_set():
+            raise TimeoutError(f"Database backup exceeded {BACKUP_TIMEOUT} seconds")
+        if return_code != 0:
+            raise RuntimeError(stderr or "Database dump command failed")
+
+
+def create_backup_file(target, output_path):
+    environment = command_environment(target)
+    if target.connection_mode == "network" and target.db_type == "mssql":
+        command, _ = network_dump_command(target, output_path)
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=BACKUP_TIMEOUT,
+            env=environment,
+        )
+        if completed.returncode != 0:
+            error = completed.stderr.decode(errors="replace").strip()
+            raise RuntimeError(error or "MSSQL BACPAC export failed")
+        return
+
+    if target.connection_mode == "docker":
+        command, _ = docker_dump_command(target)
+    else:
+        command, _ = network_dump_command(target)
+
+    if target.connection_mode == "docker" and target.db_type == "mssql":
+        container_backup = f"/var/opt/mssql/backup/{target.name}.bak"
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            timeout=BACKUP_TIMEOUT,
+            env=environment,
+        )
+        copy_command = ["docker", "exec", target.container_name, "cat", container_backup]
+        try:
+            stream_command_to_gzip(copy_command, environment, output_path)
+        finally:
+            subprocess.run(
+                ["docker", "exec", target.container_name, "rm", "-f", container_backup],
+                capture_output=True,
+                timeout=60,
+            )
+    else:
+        stream_command_to_gzip(command, environment, output_path)
+
+
 def run_backup_job(target_id):
     with app.app_context():
-        if not backup_lock.acquire(blocking=False):
-            app.logger.warning("Another backup is already running")
-            return
         target = db.session.get(BackupTarget, target_id)
         if not target:
-            backup_lock.release()
-            return
+            return "failed"
+        lock_file = acquire_backup_lock(target.id)
+        if lock_file is None:
+            message = "Skipped because another backup is already running."
+            run = BackupRun(
+                target_id=target.id,
+                target_name=target.name,
+                status="skipped",
+                message=message,
+                finished_at=datetime.now(timezone.utc),
+            )
+            db.session.add(run)
+            db.session.commit()
+            app.logger.warning(message)
+            return "skipped"
         run = BackupRun(target_id=target.id, target_name=target.name)
         db.session.add(run)
         db.session.commit()
         output_path = None
         dump_complete = False
         try:
-            command, extension = docker_dump_command(target)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = BACKUP_DIR / f"{target.name}_{stamp}.{extension}.gz"
-            if target.db_type == "mssql":
-                # Native .bak is created inside the container, then streamed out.
-                subprocess.run(command, check=True, capture_output=True, timeout=7200)
-                copy_cmd = ["docker", "exec", target.container_name, "cat", f"/var/opt/mssql/backup/{target.name}.bak"]
-                process = subprocess.Popen(copy_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if target.connection_mode == "network" and target.db_type == "mssql":
+                output_path = BACKUP_DIR / f"{target.name}_{stamp}.bacpac"
             else:
-                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            with gzip.open(output_path, "wb", compresslevel=6) as compressed:
-                while chunk := process.stdout.read(1024 * 1024):
-                    compressed.write(chunk)
-            stderr = process.stderr.read().decode(errors="replace")
-            if process.wait() != 0:
-                raise RuntimeError(stderr or "Database dump command failed")
+                extension = docker_dump_command(target)[1] if target.connection_mode == "docker" else network_dump_command(target)[1]
+                output_path = BACKUP_DIR / f"{target.name}_{stamp}.{extension}.gz"
+            create_backup_file(target, output_path)
             if output_path.stat().st_size == 0:
                 raise RuntimeError("Backup file is empty")
             dump_complete = True
@@ -267,16 +551,19 @@ def run_backup_job(target_id):
             run.filename = output_path.name
             run.size_bytes = output_path.stat().st_size
             run.message = f"Completed successfully. Drive file ID: {drive_id}" if drive_id else "Completed locally; Google Drive is not configured."
+            result = "success"
         except Exception as exc:
             if output_path and output_path.exists() and not dump_complete:
                 output_path.unlink(missing_ok=True)
             run.status = "failed"
             run.message = str(exc)[:4000]
             app.logger.exception("Backup failed for %s", target.name)
+            result = "failed"
         finally:
             run.finished_at = datetime.now(timezone.utc)
             db.session.commit()
-            backup_lock.release()
+            release_backup_lock(lock_file)
+        return result
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -304,8 +591,8 @@ def logout():
 def dashboard():
     targets = db.session.execute(select(BackupTarget).order_by(BackupTarget.name)).scalars().all()
     runs = db.session.execute(select(BackupRun).order_by(BackupRun.started_at.desc()).limit(25)).scalars().all()
-    jobs = {job.id: job.next_run_time for job in scheduler.get_jobs()}
-    return render_template("dashboard.html", targets=targets, runs=runs, jobs=jobs)
+    next_runs = {target.id: next_run_time(target.cron_expression) for target in targets if target.enabled}
+    return render_template("dashboard.html", targets=targets, runs=runs, next_runs=next_runs)
 
 
 @app.route("/targets/new", methods=["GET", "POST"])
@@ -318,21 +605,23 @@ def target_form(target_id=None):
         return redirect(url_for("dashboard"))
     if request.method == "POST":
         try:
-            cron_kwargs(request.form["cron_expression"])
+            values = validated_target_values(request.form, target)
             target = target or BackupTarget()
-            target.name = request.form["name"].strip()
-            target.db_type = request.form["db_type"]
-            target.container_name = request.form["container_name"].strip()
-            target.db_name = request.form["db_name"].strip()
-            target.db_user = request.form["db_user"].strip()
-            if request.form.get("password"):
-                target.password_encrypted = encrypt(request.form["password"])
-            target.cron_expression = request.form["cron_expression"].strip()
-            target.retention_days = max(1, int(request.form["retention_days"]))
-            target.enabled = "enabled" in request.form
+            target.name = values["name"]
+            target.db_type = values["db_type"]
+            target.connection_mode = values["connection_mode"]
+            target.db_host = values["db_host"]
+            target.db_port = values["db_port"]
+            target.container_name = values["container_name"]
+            target.db_name = values["db_name"]
+            target.db_user = values["db_user"]
+            if values["password"]:
+                target.password_encrypted = encrypt(values["password"])
+            target.cron_expression = values["cron_expression"]
+            target.retention_days = values["retention_days"]
+            target.enabled = values["enabled"]
             db.session.add(target)
             db.session.commit()
-            sync_jobs()
             flash("Backup target saved.", "success")
             return redirect(url_for("dashboard"))
         except Exception as exc:
@@ -360,7 +649,6 @@ def delete_target(target_id):
     if target:
         db.session.delete(target)
         db.session.commit()
-        sync_jobs()
         flash("Backup target deleted. Existing backup files were preserved.", "success")
     return redirect(url_for("dashboard"))
 
@@ -385,7 +673,14 @@ def settings():
             flash(f"Could not save settings: {exc}", "danger")
     return render_template(
         "settings.html",
-        folder_id=setting("google_drive_folder_id"),
+        folder_id=os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+        or setting("google_drive_folder_id"),
+        folder_id_from_env=bool(os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()),
+        google_auth_mode=GOOGLE_AUTH_MODE,
+        token_file=str(GOOGLE_TOKEN_FILE),
+        token_file_present=GOOGLE_TOKEN_FILE.is_file(),
+        credentials_file=str(GOOGLE_CREDENTIALS_FILE),
+        credentials_file_present=GOOGLE_CREDENTIALS_FILE.is_file(),
         service_account_configured=bool(setting("google_service_account_json")),
     )
 
@@ -396,8 +691,112 @@ def init_db_command():
     print("Database initialized.")
 
 
+@app.cli.command("check-google-drive")
+def check_google_drive_command():
+    """Verify configured Google credentials and destination-folder access."""
+    with app.app_context():
+        service, folder_id = drive_service()
+        if not service or not folder_id:
+            raise click.ClickException(
+                "Google Drive is not fully configured. Set credentials and "
+                "GOOGLE_DRIVE_FOLDER_ID."
+            )
+        try:
+            folder = service.files().get(
+                fileId=folder_id,
+                fields="id,name,mimeType",
+            ).execute()
+        except Exception as exc:
+            raise click.ClickException(
+                f"Could not access Google Drive folder: {exc}"
+            ) from exc
+        if folder.get("mimeType") != "application/vnd.google-apps.folder":
+            raise click.ClickException(
+                "GOOGLE_DRIVE_FOLDER_ID does not identify a Google Drive folder."
+            )
+        click.echo(
+            f"Google Drive access OK: {folder.get('name', folder_id)} ({folder_id})"
+        )
+
+
+@app.cli.command("run-backup")
+@click.option("--target-id", type=int, help="ID of the backup target to run.")
+@click.option("--target-name", help="Display name of the backup target to run.")
+def run_backup_command(target_id, target_name):
+    """Run one backup. This command is intended for system cron and diagnostics."""
+    if bool(target_id) == bool(target_name):
+        raise click.UsageError("Provide exactly one of --target-id or --target-name.")
+    with app.app_context():
+        if target_id:
+            target = db.session.get(BackupTarget, target_id)
+        else:
+            target = db.session.execute(
+                select(BackupTarget).where(BackupTarget.name == target_name)
+            ).scalar_one_or_none()
+        if not target:
+            raise click.ClickException("Backup target not found.")
+        result = run_backup_job(target.id)
+        click.echo(f"{target.name}: {result}")
+        if result == "failed":
+            raise click.ClickException("Backup failed. See the dashboard or service logs for details.")
+
+
+@app.cli.command("run-scheduled-backups")
+def run_scheduled_backups_command():
+    """Run enabled targets whose cron expression matches the current minute."""
+    local_now = datetime.now(ZoneInfo(os.getenv("TZ", "Asia/Kolkata"))).replace(second=0, microsecond=0)
+    with app.app_context():
+        targets = db.session.execute(
+            select(BackupTarget)
+            .where(BackupTarget.enabled.is_(True))
+            .order_by(BackupTarget.name)
+        ).scalars().all()
+        due_targets = []
+        for target in targets:
+            try:
+                validate_cron_expression(target.cron_expression)
+                if croniter.match(target.cron_expression, local_now):
+                    due_targets.append(target)
+            except ValueError:
+                app.logger.error(
+                    "Skipping target %s because its cron expression is invalid: %s",
+                    target.name,
+                    target.cron_expression,
+                )
+        if not due_targets:
+            return
+        failures = []
+        for target in due_targets:
+            result = run_backup_job(target.id)
+            click.echo(f"{target.name}: {result}")
+            if result == "failed":
+                failures.append(target.name)
+        if failures:
+            raise click.ClickException(f"Backups failed: {', '.join(failures)}")
+
+
+def migrate_database():
+    columns = {column["name"] for column in inspect(db.engine).get_columns("backup_target")}
+    statements = []
+    if "connection_mode" not in columns:
+        statements.append(
+            "ALTER TABLE backup_target ADD COLUMN connection_mode VARCHAR(20) NOT NULL DEFAULT 'docker'"
+        )
+    if "db_host" not in columns:
+        statements.append(
+            "ALTER TABLE backup_target ADD COLUMN db_host VARCHAR(255) NOT NULL DEFAULT ''"
+        )
+    if "db_port" not in columns:
+        statements.append("ALTER TABLE backup_target ADD COLUMN db_port INTEGER")
+    for statement in statements:
+        db.session.execute(text(statement))
+    if statements:
+        db.session.commit()
+
+
 def initialize():
     db.create_all()
+    migrate_database()
     if not db.session.execute(select(User).where(User.username == "admin")).scalar_one_or_none():
         db.session.add(User(username="admin", password_hash=generate_password_hash("Fusil@admin55")))
         db.session.commit()
@@ -405,10 +804,6 @@ def initialize():
 
 with app.app_context():
     initialize()
-
-if not scheduler.running:
-    scheduler.start()
-    sync_jobs()
 
 
 if __name__ == "__main__":

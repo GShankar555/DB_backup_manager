@@ -1,0 +1,4 @@
+# Run the external cron dispatcher once per minute. The application itself does
+# not contain a background scheduler. Install this file as:
+# /etc/cron.d/db-backup-manager
+* * * * * backupmgr . /etc/db-backup-manager.env && /opt/db-backup-manager/.venv/bin/flask --app /opt/db-backup-manager/app.py run-scheduled-backups 2>&1 | /usr/bin/logger -t db-backup-manager-cron
