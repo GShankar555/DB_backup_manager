@@ -112,13 +112,13 @@ sudo useradd --system --home /var/lib/db-backup-manager \
 # Only if local Docker mode will be used:
 sudo usermod -aG docker backupmgr
 
-sudo mkdir -p /opt/db-backup-manager
-sudo cp -a . /opt/db-backup-manager/
-sudo chown -R backupmgr:backupmgr /opt/db-backup-manager
+sudo mkdir -p /var/www/DB_backup_manager
+sudo cp -a . /var/www/DB_backup_manager/
+sudo chown -R backupmgr:backupmgr /var/www/DB_backup_manager
 
-sudo -u backupmgr python3 -m venv /opt/db-backup-manager/.venv
-sudo -u backupmgr /opt/db-backup-manager/.venv/bin/pip install \
-  -r /opt/db-backup-manager/requirements.txt
+sudo -u backupmgr python3 -m venv /var/www/DB_backup_manager/.venv
+sudo -u backupmgr /var/www/DB_backup_manager/.venv/bin/pip install \
+  -r /var/www/DB_backup_manager/requirements.txt
 
 sudo mkdir -p /var/lib/db-backup-manager/backups
 sudo chown -R backupmgr:backupmgr /var/lib/db-backup-manager
@@ -130,10 +130,10 @@ sudo chmod 700 /var/lib/db-backup-manager
 Generate independent application and encryption secrets:
 
 ```bash
-/opt/db-backup-manager/.venv/bin/python -c \
+/var/www/DB_backup_manager/.venv/bin/python -c \
   "import secrets; print(secrets.token_urlsafe(48))"
 
-/opt/db-backup-manager/.venv/bin/python -c \
+/var/www/DB_backup_manager/.venv/bin/python -c \
   "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
@@ -184,7 +184,7 @@ sudo chmod 640 /opt/creds/token.json /opt/creds/credentials.json
 ## Install the web service
 
 ```bash
-sudo cp /opt/db-backup-manager/deploy/db-backup-manager.service \
+sudo cp /var/www/DB_backup_manager/deploy/db-backup-manager.service \
   /etc/systemd/system/db-backup-manager.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now db-backup-manager
@@ -197,7 +197,7 @@ manual-run requests.
 ## Install the external cron dispatcher
 
 ```bash
-sudo cp /opt/db-backup-manager/deploy/db-backup-manager.cron \
+sudo cp /var/www/DB_backup_manager/deploy/db-backup-manager.cron \
   /etc/cron.d/db-backup-manager
 sudo chown root:root /etc/cron.d/db-backup-manager
 sudo chmod 644 /etc/cron.d/db-backup-manager
@@ -213,12 +213,12 @@ Useful manual checks:
 
 ```bash
 sudo -u backupmgr sh -c \
-  '. /etc/db-backup-manager.env && /opt/db-backup-manager/.venv/bin/flask \
-  --app /opt/db-backup-manager/app.py run-scheduled-backups'
+  '. /etc/db-backup-manager.env && /var/www/DB_backup_manager/.venv/bin/flask \
+  --app /var/www/DB_backup_manager/app.py run-scheduled-backups'
 
 sudo -u backupmgr sh -c \
-  '. /etc/db-backup-manager.env && /opt/db-backup-manager/.venv/bin/flask \
-  --app /opt/db-backup-manager/app.py run-backup --target-name production-postgres'
+  '. /etc/db-backup-manager.env && /var/www/DB_backup_manager/.venv/bin/flask \
+  --app /var/www/DB_backup_manager/app.py run-backup --target-name production-postgres'
 ```
 
 Cron output is sent to the system journal:
@@ -233,7 +233,7 @@ Edit `nginx/default.conf` and replace `server_name _;` with the server's domain,
 then install it:
 
 ```bash
-sudo cp /opt/db-backup-manager/nginx/default.conf \
+sudo cp /var/www/DB_backup_manager/nginx/default.conf \
   /etc/nginx/sites-available/db-backup-manager
 sudo ln -s /etc/nginx/sites-available/db-backup-manager \
   /etc/nginx/sites-enabled/db-backup-manager
@@ -283,8 +283,8 @@ Test credentials and folder access on the VPS with:
 
 ```bash
 sudo -u backupmgr sh -c \
-  '. /etc/db-backup-manager.env && /opt/db-backup-manager/.venv/bin/flask \
-  --app /opt/db-backup-manager/app.py check-google-drive'
+  '. /etc/db-backup-manager.env && /var/www/DB_backup_manager/.venv/bin/flask \
+  --app /var/www/DB_backup_manager/app.py check-google-drive'
 ```
 
 Without Drive configuration, backups stay in `BACKUP_DIR`. Retention applies to

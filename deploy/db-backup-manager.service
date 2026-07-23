@@ -7,10 +7,10 @@ Wants=network-online.target
 Type=simple
 User=backupmgr
 Group=backupmgr
-WorkingDirectory=/opt/db-backup-manager
+WorkingDirectory=/var/www/DB_backup_manager
 EnvironmentFile=/etc/db-backup-manager.env
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/db-backup-manager/.venv/bin/gunicorn --config /opt/db-backup-manager/gunicorn.conf.py app:app
+ExecStart=/var/www/DB_backup_manager/.venv/bin/gunicorn --config /var/www/DB_backup_manager/gunicorn.conf.py app:app
 Restart=on-failure
 RestartSec=5
 UMask=0077
