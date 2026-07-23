@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Backup Manager{% endblock %}
+{% block main_class %}login-wrap{% endblock %}
+{% block content %}
+<section class="login-card">
+  <div class="logo">DB</div>
+  <h1>Backup Manager</h1>
+  <p>Sign in to manage automated database backups.</p>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Username<input name="username" autocomplete="username" required autofocus></label>
+    <label>Password<input type="password" name="password" autocomplete="current-password" required></label>
+    <button type="submit">Sign in</button>
+  </form>
+</section>
+{% endblock %}

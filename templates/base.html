@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}Backup Manager{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  {% if current_user.is_authenticated %}
+  <header>
+    <a class="brand" href="{{ url_for('dashboard') }}">Backup Manager</a>
+    <nav>
+      <a href="{{ url_for('dashboard') }}">Dashboard</a>
+      <a href="{{ url_for('settings') }}">Google Drive</a>
+      <a href="{{ url_for('logout') }}">Sign out</a>
+    </nav>
+  </header>
+  {% endif %}
+  <main class="{% block main_class %}{% endblock %}">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}
+      <div class="flash {{ category }}">{{ message }}</div>
+      {% endfor %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
+

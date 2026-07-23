@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div><h1>Database backups</h1><p>Container backups, schedules, retention, and recent activity.</p></div>
+  <a class="button" href="{{ url_for('target_form') }}">Add database</a>
+</div>
+
+<section class="cards">
+{% for target in targets %}
+  <article class="card">
+    <div class="card-head">
+      <div><span class="type">{{ target.db_type }}</span><h2>{{ target.name }}</h2></div>
+      <span class="status {{ 'on' if target.enabled else 'off' }}">{{ 'Enabled' if target.enabled else 'Paused' }}</span>
+    </div>
+    <dl>
+      <div><dt>Container</dt><dd>{{ target.container_name }}</dd></div>
+      <div><dt>Database</dt><dd>{{ target.db_name }}</dd></div>
+      <div><dt>Schedule</dt><dd><code>{{ target.cron_expression }}</code></dd></div>
+      <div><dt>Next run</dt><dd>{{ jobs.get('backup_' ~ target.id) or 'Not scheduled' }}</dd></div>
+      <div><dt>Retention</dt><dd>{{ target.retention_days }} days</dd></div>
+    </dl>
+    <div class="actions">
+      <form method="post" action="{{ url_for('run_target', target_id=target.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button>Run now</button></form>
+      <a class="button secondary" href="{{ url_for('target_form', target_id=target.id) }}">Edit</a>
+      <form method="post" action="{{ url_for('delete_target', target_id=target.id) }}" onsubmit="return confirm('Delete this target? Backup files will remain.')">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="danger">Delete</button>
+      </form>
+    </div>
+  </article>
+{% else %}
+  <div class="empty"><h2>No databases configured</h2><p>Add a Docker database container to schedule its first backup.</p></div>
+{% endfor %}
+</section>
+
+<section class="panel">
+  <h2>Recent runs</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Database</th><th>Started</th><th>Status</th><th>File</th><th>Size</th><th>Message</th></tr></thead>
+      <tbody>
+      {% for run in runs %}
+        <tr>
+          <td>{{ run.target_name }}</td>
+          <td>{{ run.started_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+          <td><span class="status {{ run.status }}">{{ run.status }}</span></td>
+          <td>{{ run.filename or '—' }}</td>
+          <td>{{ ('%.1f MB'|format(run.size_bytes / 1048576)) if run.size_bytes else '—' }}</td>
+          <td class="message">{{ run.message or 'Backup is running…' }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6" class="muted">No backup runs yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
